@@ -1,0 +1,217 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Threads Auto Pro - 마케팅 자동화 프로그램</title>
+    <!-- 구글 폰트: Outfit -->
+    <link href="https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;600;700;800&display=swap" rel="stylesheet">
+    <!-- Vanilla CSS 디자인 링크 -->
+    <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+    <!-- 상단 헤더 (흰색 배경 및 가로형 탭 네비게이션) -->
+    <header class="app-header">
+        <div class="logo-area">
+            <div class="logo-icon">T</div>
+            <div class="title-box">
+                    <h1>Threads Auto Pro</h1>
+                <span class="subtitle-tag">Chrome Automation</span>
+            </div>
+        </div>
+
+        <!-- 중앙 가로 배치 탭 -->
+        <nav class="tab-nav">
+            <button class="tab-btn active" onclick="switchTab('settings')">⚙️ 설정 & 계정</button>
+            <button class="tab-btn" onclick="switchTab('datainput')">📁 데이터 입력</button>
+            <button class="tab-btn" onclick="switchTab('dashboard')">📊 대시보드</button>
+        </nav>
+
+        <!-- 우측 상태 표시기 -->
+        <div class="status-indicator">
+            <span id="status-dot" class="dot"></span>
+            <span>Status: <span id="status-text">Idle</span></span>
+        </div>
+    </header>
+
+    <!-- 메인 콘텐츠 영역 -->
+    <div class="main-layout">
+        <main class="tab-content">
+            <!-- 1. 설정 및 계정 탭 -->
+            <section id="settings-tab" class="tab-pane active">
+                <div class="grid-2col">
+                    <!-- 좌측: AI & System 설정 -->
+                    <div class="card">
+                        <h2>🤖 AI & System</h2>
+                        
+                        <!-- Headless Mode 한 줄 정렬 -->
+                        <div class="headless-row">
+                            <div class="headless-info">
+                                <span class="headless-title">Headless Mode (백그라운드 실행)</span>
+                                <span class="headless-desc">안정성을 위해 체크 해제 권장 (창이 보여야 안전)</span>
+                            </div>
+                            <input type="checkbox" id="headless-mode" onchange="saveSettings(true)">
+                        </div>
+
+                        <div class="form-group">
+                            <label for="publish-delay">발행 후 대기 시간 (댓글 작성 전 대기 시간, 초)</label>
+                            <input type="number" id="publish-delay" value="10" min="5" max="60" placeholder="기본값: 10" onchange="saveSettings(true)">
+                        </div>
+
+                        <div class="form-group">
+                            <label for="openai-key">OpenAI API Key (없으면 무료 번역)</label>
+                            <input type="password" id="openai-key" placeholder="sk-..." onchange="saveSettings(true)">
+                        </div>
+                        
+                        <div class="form-group">
+                            <label for="gemini-key">Gemini API Key (없으면 무료 번역)</label>
+                            <input type="password" id="gemini-key" placeholder="AIza..." onchange="saveSettings(true)">
+                        </div>
+                        
+                        <div class="form-group">
+                            <label for="system-prompt">System Prompt</label>
+                            <textarea id="system-prompt" rows="5" placeholder="AI가 본문을 다듬을 때 가이드라인을 적어주세요." onchange="saveSettings(true)"></textarea>
+                        </div>
+                        
+                        <button class="btn btn-primary btn-full" onclick="saveSettings()">💾 설정 저장</button>
+                    </div>
+
+                    <!-- 우측: Accounts 계정 설정 -->
+                    <div class="card">
+                        <h2>👥 Accounts</h2>
+                        <div class="account-add-box">
+                            <input type="text" id="new-account-name" placeholder="Threads 닉네임 입력 (한글/특수문자 가능)">
+                            <button class="btn btn-secondary" onclick="addAccount()">+ 추가</button>
+                        </div>
+                        <div class="table-container">
+                            <table class="data-table" id="accounts-table">
+                                <thead>
+                                    <tr>
+                                        <th>닉네임(ID)</th>
+                                        <th>상태</th>
+                                        <th>관리</th>
+                                    </tr>
+                                </thead>
+                                <tbody>
+                                    <!-- 동적 삽입 -->
+                                </tbody>
+                            </table>
+                        </div>
+                        <div class="info-footer-text">
+                            <span>ℹ️ '로그인'을 눌러 브라우저에서 직접 로그인하세요. (ID 수정 시 로그인 정보 유지됨)</span>
+                        </div>
+                    </div>
+                </div>
+            </section>
+
+            <!-- 2. 데이터 입력 탭 -->
+            <section id="datainput-tab" class="tab-pane">
+                <!-- 상단 제어바 -->
+                <div class="control-bar">
+                    <div class="control-group">
+                        <span style="font-size: 14px;">🕒</span>
+                        <label for="start-time">시작 시간</label>
+                        <input type="time" id="start-time" value="09:00">
+                    </div>
+                    <div class="bar-divider"></div>
+                    <div class="control-group">
+                        <label for="time-interval">간격(분)</label>
+                        <input type="number" id="time-interval" value="20" min="1">
+                    </div>
+                    <button class="btn btn-primary" onclick="applyTimeInterval()">일괄 적용</button>
+                    <div class="bar-divider"></div>
+                    <div class="control-group">
+                        <button class="btn btn-gray-outline" onclick="sortByTime()" title="시간 순 정렬">🕒 시간 정렬</button>
+                        <button class="btn btn-gray-outline" onclick="groupByAccount()" title="1계정 우선 정렬">👤 1계정 우선</button>
+                        <button class="btn btn-gray-outline" onclick="interleaveAccounts()" title="다계정 교차 정렬">👥 다계정 순서</button>
+                    </div>
+                    <div class="bar-divider"></div>
+                    <div class="control-group">
+                        <button class="btn btn-purple-outline" onclick="bulkAiRewrite()" title="전체 본문 AI 변환 (리롤)">🤖 전체 AI 변환</button>
+                    </div>
+                    
+                    <div class="spacer"></div>
+                    
+                    <div class="control-actions-right">
+                        <!-- 파일 업로드 대리 버튼 -->
+                        <input type="file" id="csv-file-input" accept=".csv, .xlsx, .xls" style="display: none;" onchange="loadCsvFile(event)">
+                        <button class="btn btn-red-outline" onclick="clearTable()">🔄 초기화</button>
+                        <button class="btn btn-gray-outline" onclick="downloadTemplate()">📥 템플릿</button>
+                        <button class="btn btn-gray-outline" onclick="document.getElementById('csv-file-input').click()">📂 불러오기</button>
+                        <button class="btn btn-purple-fill" onclick="saveAndStartAutomation()">예약 실행 ✈️</button>
+                    </div>
+                </div>
+
+                <!-- 데이터 입력 그리드 테이블 -->
+                <div class="table-wrapper">
+                    <table class="editable-table" id="data-input-table">
+                        <thead>
+                            <tr>
+                                <th style="width: 40px;"></th>
+                                <th style="width: 22%;">내용 (Content) *</th>
+                                <th style="width: 18%;">댓글 (Comment)</th>
+                                <th style="width: 16%;">파일경로 (File)</th>
+                                <th style="width: 8%;">태그 (Tag)</th>
+                                <th style="width: 8%;">주제 (Topic)</th>
+                                <th style="width: 8%;">시간 (Time)</th>
+                                <th style="width: 6%;">언어</th>
+                                <th style="width: 10%;">AI (GPT/Gemini)</th>
+                                <th style="width: 10%;">계정 (ID) *</th>
+                                <th style="width: 4%;"></th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            <!-- 동적 삽입 -->
+                        </tbody>
+                    </table>
+                </div>
+                <div class="table-footer-actions">
+                    <button class="btn btn-dashed" onclick="addNewRow()">+ 행 추가</button>
+                </div>
+            </section>
+
+            <!-- 3. 대시보드 탭 -->
+            <section id="dashboard-tab" class="tab-pane">
+                <!-- 상단 메인 버튼 -->
+                <div class="dashboard-controls">
+                    <button class="btn btn-large btn-success" id="main-start-btn" onclick="startAutomation()">▶️ 자동화 시작</button>
+                    <button class="btn btn-large btn-danger" id="main-stop-btn" onclick="stopAutomation()" disabled>■ 중지</button>
+                </div>
+
+                <div class="grid-2col" style="margin-top: 20px;">
+                    <!-- 좌측: 작업 대기열 -->
+                    <div class="card">
+                        <h2>📋 실시간 예약 작업 대기열</h2>
+                        <div class="table-container">
+                            <table class="data-table" id="queue-status-table">
+                                <thead>
+                                    <tr>
+                                        <th>계정</th>
+                                        <th>예약 시간</th>
+                                        <th>본문 요약</th>
+                                        <th>상태</th>
+                                    </tr>
+                                </thead>
+                                <tbody>
+                                    <!-- 동적 삽입 -->
+                                </tbody>
+                            </table>
+                        </div>
+                    </div>
+
+                    <!-- 우측: SysTek Logs 콘솔 -->
+                    <div class="card">
+                        <h2>💻 SysTek Logs (작업 상황)</h2>
+                        <div class="console-box" id="sys-logs-console">
+                            <div class="log-line text-muted">[System] 프로그램이 초기화되었습니다. 로그 대기 중...</div>
+                        </div>
+                    </div>
+                </div>
+            </section>
+        </main>
+    </div>
+
+    <!-- 프론트엔드 애플리케이션 스크립트 -->
+    <script src="/static/app.js"></script>
+</body>
+</html>
