@@ -647,22 +647,38 @@ class ThreadsProUploader:
                             except Exception as upload_err:
                                 self.log(f"[{username}] 미디어 업로드 중 에러 발생: {upload_err}")
                         else:
-                            self.log(f"[{username}] 경고: 파일 첨부 버튼을 찾지 못해 본문만 게시합니다.")
-                            
-                    # 업로드 완료 대기 (최대 10초, 100ms 단위 반응형 폴링)
-                    self.log(f"[{username}] 미디어 업로드 및 프리뷰 생성 대기 중 (최대 10초)...")
+                            # 첨부 수단이 전혀 없으면 사진이 빠진 반쪽 게시가 되므로 발행 전에 실패 처리
+                            self.log(f"[{username}] 오류: 파일 첨부 버튼을 찾지 못했습니다. 미디어 누락 게시를 막기 위해 실패 처리합니다.")
+                            await context.close()
+                            await browser.close()
+                            return False
+
+                    # 업로드 완료 대기 (최대 30초, 100ms 단위 반응형 폴링)
+                    self.log(f"[{username}] 미디어 업로드 및 프리뷰 생성 대기 중 (최대 30초)...")
                     uploaded_successfully = False
-                    for _ in range(100):
+                    current_img_count = initial_img_count
+                    for _ in range(300):
                         current_img_count = await dialog.locator('img, video').count()
                         if current_img_count >= initial_img_count + len(normalized_paths):
                             uploaded_successfully = True
                             break
                         await asyncio.sleep(0.1)
-                        
+
                     if uploaded_successfully:
-                        self.log(f"[{username}] 미디어 업로드 완료 확인 (이미지 {len(normalized_paths)}개 추가됨)")
+                        self.log(f"[{username}] 미디어 업로드 완료 확인 (미디어 {len(normalized_paths)}개 추가됨)")
                     else:
-                        self.log(f"[{username}] 경고: 10초 내에 미디어 프리뷰가 완전히 생성되지 않았습니다. 현재 상태로 포스팅을 진행합니다.")
+                        # 프리뷰가 다 생기기 전에 게시하면 사진/영상이 빠진 채 올라간다.
+                        # 반쪽 게시 대신 실패로 기록해 재시도할 수 있게 한다 (아직 아무것도 게시되지 않은 시점)
+                        attached = max(0, current_img_count - initial_img_count)
+                        screenshot_path = os.path.join(self.session_dir, f"error_media_{username}.png")
+                        try:
+                            await page.screenshot(path=screenshot_path)
+                        except Exception:
+                            pass
+                        self.log(f"[{username}] 오류: 30초 내에 미디어 프리뷰가 {attached}/{len(normalized_paths)}개만 생성되었습니다. 미디어 누락 게시를 막기 위해 실패 처리합니다. (스크린샷: {screenshot_path})")
+                        await context.close()
+                        await browser.close()
+                        return False
                 
                 # 4. 스레드 추가 (댓글/링크용 2/2 포스트 영역 생성 및 기입)
                 if comment_text:
@@ -726,13 +742,27 @@ class ThreadsProUploader:
                             await browser.close()
                             return False
                     else:
-                        self.log(f"[{username}] 오류: '스레드에 추가' 버튼을 찾지 못해 본문만 게시합니다.")
+                        # 댓글 없이 본문만 올라가는 반쪽 성공을 막기 위해 발행 전에 실패 처리
+                        screenshot_path = os.path.join(self.session_dir, f"error_comment_{username}.png")
+                        try:
+                            await page.screenshot(path=screenshot_path)
+                        except Exception:
+                            pass
+                        self.log(f"[{username}] 오류: '스레드에 추가' 버튼을 찾지 못했습니다. 댓글 누락 게시를 막기 위해 실패 처리합니다. (스크린샷: {screenshot_path})")
+                        await context.close()
+                        await browser.close()
+                        return False
                 
                 # 5. 최종 발행하기 (일괄 업로드)
                 self.log(f"[{username}] 스레드 일괄 발행 중...")
                 posted = False
-                
-                # API 네트워크 통신 모니터링 로그 등록 (서버 응답 확인용)
+
+                # API 네트워크 통신 모니터링 로그 등록 (서버 응답 확인 및 발행 완료 신호 집계용).
+                # 본문과 댓글은 게시 클릭 후 순차 발행되는데, 특히 영상이 있으면 본문 발행이
+                # 오래 걸려 댓글 발행 전에 브라우저를 닫으면 댓글이 유실된다. 발행 1건마다
+                # 서버로 전송되는 ig_media_publish_success 이벤트를 세어 완료를 판단한다.
+                publish_signal = {"count": 0}
+
                 async def handle_response(res):
                     try:
                         req = res.request
@@ -742,6 +772,10 @@ class ThreadsProUploader:
                             self.log(f"[Network Log] POST {res.url} (Status: {res.status})")
                             if post_data:
                                 self.log(f"[Network Log] Request: {post_data[:300]}")
+                                hits = post_data.count("ig_media_publish_success")
+                                if hits:
+                                    publish_signal["count"] += hits
+                                    self.log(f"[{username}] 발행 완료 신호 감지 (누적 {publish_signal['count']}건)")
                             self.log(f"[Network Log] Response: {response_text[:400]}")
                     except Exception:
                         pass
@@ -838,11 +872,88 @@ class ThreadsProUploader:
                     return False
                     
                 try:
-                    wait_secs = max(1, int(publish_delay))
+                    min_wait = max(1, int(publish_delay))
                 except (TypeError, ValueError):
-                    wait_secs = 5
-                self.log(f"[{username}] 스레드 본문 및 댓글 일괄 발행 성공! 네트워크 요청 완료를 위해 {wait_secs}초 대기합니다.")
-                await asyncio.sleep(wait_secs)
+                    min_wait = 5
+
+                # 작성 창이 닫혀도 실제 발행(특히 댓글)은 백그라운드에서 진행 중일 수 있다.
+                # 기대하는 발행 건수(본문 1건 + 댓글 1건)만큼 완료 신호가 올 때까지 기다린 뒤 닫는다.
+                expected_publishes = 2 if comment_text else 1
+                max_wait = max(min_wait, 60)
+                self.log(f"[{username}] 게시 확인됨. 발행 완료 신호 대기 중... (기대 {expected_publishes}건, 최소 {min_wait}초 / 최대 {max_wait}초)")
+                waited = 0.0
+                while waited < max_wait:
+                    if publish_signal["count"] >= expected_publishes and waited >= min_wait:
+                        break
+                    await asyncio.sleep(0.5)
+                    waited += 0.5
+
+                if publish_signal["count"] >= expected_publishes:
+                    self.log(f"[{username}] 스레드 본문 및 댓글 일괄 발행 성공! (발행 신호 {publish_signal['count']}/{expected_publishes}건, {waited:.0f}초 대기)")
+                else:
+                    self.log(f"[{username}] 발행 신호가 {publish_signal['count']}/{expected_publishes}건 확인되었습니다. 실제 게시 여부를 프로필에서 직접 검증합니다.")
+
+                # 6. 실제 게시 여부 최종 검증 (Ground Truth).
+                # 서버가 게시를 조용히 무시하는 경우(스팸 필터 등)에는 작성 창이 닫혀도
+                # 실제로는 올라가지 않는다. 프로필에서 방금 올린 글을 직접 찾아 확인해야
+                # '성공으로 기록됐는데 실제론 없는' 상황을 잡아낼 수 있다.
+                needle = content.strip().splitlines()[0][:25].strip() if content.strip() else ""
+                actual_handle = None
+                try:
+                    profile_link = page.locator('a[href^="/@"]').first
+                    if await profile_link.count() > 0:
+                        href = await profile_link.get_attribute("href")
+                        if href:
+                            actual_handle = href.strip("/").split("/")[0].replace("@", "")
+                except Exception:
+                    pass
+
+                if needle and len(needle) >= 5 and actual_handle:
+                    self.log(f"[{username}] 게시 결과 검증 중... (@{actual_handle} 프로필 확인)")
+                    post_found = False
+                    for _ in range(6):  # 영상 처리 지연을 감안해 최대 약 45초 재확인
+                        try:
+                            await page.goto(f"https://www.threads.com/@{actual_handle}", timeout=30000)
+                            await asyncio.sleep(4)
+                            if await page.get_by_text(needle).count() > 0:
+                                post_found = True
+                                break
+                        except Exception:
+                            pass
+                        await asyncio.sleep(3)
+
+                    if not post_found:
+                        screenshot_path = os.path.join(self.session_dir, f"error_verify_{username}.png")
+                        try:
+                            await page.screenshot(path=screenshot_path)
+                        except Exception:
+                            pass
+                        self.log(f"[{username}] 오류: 게시 요청은 전송되었지만 프로필에서 게시물을 찾지 못했습니다. 서버에서 조용히 거부(스팸 필터 등)되었을 수 있어 실패로 기록합니다. (스크린샷: {screenshot_path})")
+                        await context.close()
+                        await browser.close()
+                        return False
+
+                    self.log(f"[{username}] 프로필에서 게시물 확인 완료!")
+
+                    # 첫 댓글까지 실제로 달렸는지 확인
+                    if comment_text:
+                        comment_needle = comment_text.strip().splitlines()[0][:25].strip()
+                        if comment_needle and len(comment_needle) >= 5:
+                            comment_found = False
+                            try:
+                                await page.get_by_text(needle).first.click()
+                                await asyncio.sleep(4)
+                                if await page.get_by_text(comment_needle).count() > 0:
+                                    comment_found = True
+                            except Exception:
+                                pass
+                            if comment_found:
+                                self.log(f"[{username}] 첫 댓글까지 정상 게시 확인 완료!")
+                            else:
+                                self.log(f"[{username}] ⚠️ 경고: 본문은 게시되었지만 첫 댓글이 확인되지 않았습니다. 게시물에서 직접 확인하고 필요하면 수동으로 댓글을 달아주세요.")
+                else:
+                    self.log(f"[{username}] 안내: 게시 결과 자동 검증을 건너뜁니다 (본문이 너무 짧거나 프로필 주소를 찾지 못함).")
+
                 await context.close()
                 await browser.close()
                 return True
