@@ -239,30 +239,26 @@ class ThreadsProUploader:
         session_file = os.path.join(self.session_dir, f"{safe_username}.json")
         profile_dir = os.path.join(self.session_dir, f"profile_{safe_username}")
         
-        # SingletonLock 등 크롬 잠금 파일 제거 (비정상 종료 대비)
-        for lock_name in ["SingletonLock", "SingletonSocket", "SingletonCookie"]:
-            lock_path = os.path.join(profile_dir, lock_name)
-            if os.path.exists(lock_path) or os.path.islink(lock_path):
-                try:
-                    os.unlink(lock_path)
-                    self.log(f"[{username}] 브라우저 잠금 파일({lock_name})을 정리했습니다.")
-                except Exception as e:
-                    self.log(f"[{username}] 브라우저 잠금 파일 정리 중 예외 발생: {e}")
-
         self.log(f"[{username}] 계정 수동 로그인 브라우저 구동 중...")
         
         async with async_playwright() as p:
-            # Persistent Context를 띄워 자동 로그인 쿠키 획득 보장
-            # user_agent를 생략하여 headful 크롬 본연의 정상적인 User-Agent와 API 일치도를 높임
-            context = await p.chromium.launch_persistent_context(
-                user_data_dir=profile_dir,
+            # 프로필 폴더 잠금(Lock) 충돌을 원천 해결하기 위해 표준 browser/context 기동 방식으로 전환
+            browser = await p.chromium.launch(
                 headless=False,
-                locale="ko-KR",
-                args=["--disable-blink-features=AutomationControlled", "--window-size=1024,860"],
-                viewport={"width": 1024, "height": 860}
+                args=["--disable-blink-features=AutomationControlled", "--window-size=1024,860"]
             )
             
-            page = context.pages[0] if context.pages else await context.new_page()
+            context_kwargs = {
+                "locale": "ko-KR",
+                "viewport": {"width": 1024, "height": 860},
+                "user_agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+            }
+            # 기존 세션 파일이 존재하면 편의를 위해 쿠키 자동 주입
+            if os.path.exists(session_file):
+                context_kwargs["storage_state"] = session_file
+                
+            context = await browser.new_context(**context_kwargs)
+            page = await context.new_page()
             await page.add_init_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
             
             # 스레드 로그인 페이지로 직접 진입하여 쿠키 정보 획득
@@ -368,6 +364,7 @@ class ThreadsProUploader:
                 self.log("경고: 로그인이 완료되지 않은 상태에서 브라우저가 종료되었습니다.")
                 
             await context.close()
+            await browser.close()
             return logged_in
 
     async def post_to_threads(self, username, headless, content, media_paths, comment_text, topic_text="", publish_delay=10):
