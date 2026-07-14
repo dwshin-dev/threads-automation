@@ -1,0 +1,4 @@
+customtkinter
+playwright
+pandas
+openpyxl

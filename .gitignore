@@ -1,0 +1,28 @@
+# Virtual environment
+venv/
+
+# Sensitive sessions and cookie files
+sessions/*.json
+sessions/*.png
+sessions/*.webp
+sessions/profile_*
+sessions/threads_session_*
+
+# System and user configuration
+config.json
+queue.json
+
+# Python cache
+__pycache__/
+*.pyc
+
+# macOS system files
+.DS_Store
+
+# Temporary scratchpad scripts
+scratch/
+scratch_*
+*.png
+*.jpg
+*.jpeg
+*.html
