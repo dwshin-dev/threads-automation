@@ -265,14 +265,13 @@ class ThreadsProUploader:
             page = context.pages[0] if context.pages else await context.new_page()
             await page.add_init_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
             
-            # 인스타그램 로그인 페이지로 선 진입하여 안전하게 로그인 세션 확보
-            await page.goto("https://www.instagram.com/accounts/login/")
-            self.log("안전한 연동을 위해 인스타그램 로그인 페이지로 접속했습니다. 브라우저 창에서 인스타그램 로그인을 먼저 완료해 주세요.")
+            # 스레드 로그인 페이지로 직접 진입하여 쿠키 정보 획득
+            await page.goto("https://www.threads.net/login")
+            self.log("브라우저 창에서 스레드(Threads) 로그인을 진행해 주세요.")
             
             # 로그인 성공 여부를 주기적으로 체크
             logged_in = False
             last_url = ""
-            redirected_to_threads = False
             
             while True:
                 # 사용자가 창을 강제로 닫았는지 확인
@@ -283,20 +282,6 @@ class ThreadsProUploader:
                 if current_url != last_url:
                     self.log(f"[{username}] 브라우저 주소 변경: {current_url}")
                     last_url = current_url
-                
-                # 1. 인스타그램 로그인 성공 여부 검사 (쿠키 확인)
-                if not redirected_to_threads:
-                    try:
-                        cookies = await context.cookies()
-                        is_ig_logged_in = any(c['name'] in ['ds_user_id', 'sessionid'] and 'instagram.com' in c['domain'] for c in cookies)
-                        if is_ig_logged_in:
-                            self.log(f"[{username}] 인스타그램 로그인 완료가 감지되었습니다! 스레드로 이동하여 연동을 진행합니다...")
-                            await page.goto("https://www.threads.net/login")
-                            redirected_to_threads = True
-                            await asyncio.sleep(3)
-                            continue
-                    except Exception:
-                        pass
                 
                 # 404 에러 페이지 감지 시 self-healing 리다이렉트 수행
                 try:
@@ -315,6 +300,7 @@ class ThreadsProUploader:
                     try:
                         # 로그인 성공 시 노출되는 주요 요소들 목록
                         selectors = [
+                            'a[href="/compose"]',
                             'a[href="/write"]',
                             'svg[aria-label="새로운 스레드"]',
                             'svg[aria-label="Write"]',
