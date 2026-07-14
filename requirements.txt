@@ -2,3 +2,6 @@ customtkinter
 playwright
 pandas
 openpyxl
+flask
+openai
+google-generativeai

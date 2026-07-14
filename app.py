@@ -9,7 +9,7 @@ import threading
 import re
 import pandas as pd
 from flask import Flask, request, jsonify, render_template, Response
-from uploader import ThreadsProUploader, rewrite_content
+from uploader import ThreadsProUploader, rewrite_content, safe_session_name
 
 app = Flask(__name__)
 
@@ -109,7 +109,7 @@ def handle_accounts():
             save_config(config)
             
             # 세션 쿠키 파일 및 프로필 삭제 시도
-            safe_user = re.sub(r"[^a-zA-Z0-9_]", "", username)
+            safe_user = safe_session_name(username)
             session_file = os.path.join(SESSION_DIR, f"{safe_user}.json")
             if os.path.exists(session_file):
                 os.remove(session_file)
@@ -123,7 +123,7 @@ def handle_accounts():
         account_status = []
         account_handles = config.get("account_handles", {})
         for user in config['accounts']:
-            safe_user = re.sub(r"[^a-zA-Z0-9_]", "", user)
+            safe_user = safe_session_name(user)
             session_file = os.path.join(SESSION_DIR, f"{safe_user}.json")
             status = "로그인 완료" if os.path.exists(session_file) else "로그인 필요"
             actual = account_handles.get(user, "")
@@ -159,8 +159,8 @@ def rename_account():
     save_config(config)
     
     # 세션 파일 이름 변경
-    safe_old = re.sub(r"[^a-zA-Z0-9_]", "", old_username)
-    safe_new = re.sub(r"[^a-zA-Z0-9_]", "", new_username)
+    safe_old = safe_session_name(old_username)
+    safe_new = safe_session_name(new_username)
     old_session_file = os.path.join(SESSION_DIR, f"{safe_old}.json")
     new_session_file = os.path.join(SESSION_DIR, f"{safe_new}.json")
     
@@ -367,11 +367,13 @@ def handle_queue():
         for row in data:
             if 'status' not in row:
                 row['status'] = 'Pending'
-        save_queue(data)
+        with queue_lock:
+            save_queue(data)
         add_log("[System] 예약 대기열이 업데이트되었습니다.")
         return jsonify({"status": "success", "queue": data})
     else:
-        return jsonify(load_queue())
+        with queue_lock:
+            return jsonify(load_queue())
 
 @app.route('/api/logs')
 def stream_logs():
@@ -394,171 +396,213 @@ def stream_logs():
 # --- 자동화 스케줄러 프로세스 ---
 running_accounts = set()
 running_accounts_lock = threading.Lock()
+queue_lock = threading.Lock()
+
+# 예약 시각이 지나도 실행을 허용하는 유예 시간(분).
+# 같은 계정의 앞 작업 때문에 정각(분)을 놓친 예약이 영영 방치되는 문제를 막는다.
+GRACE_MINUTES = 30
+
+def parse_hhmm(value):
+    """'HH:MM' 또는 'H:MM' 문자열을 자정 기준 분(minute)으로 변환. 형식이 아니면 None."""
+    try:
+        parts = str(value).strip().split(":")
+        if len(parts) != 2:
+            return None
+        h, m = int(parts[0]), int(parts[1])
+        if 0 <= h <= 23 and 0 <= m <= 59:
+            return h * 60 + m
+    except (ValueError, TypeError):
+        pass
+    return None
+
+def update_row_status(row, new_status):
+    """queue.json을 다시 읽어 해당 행의 상태만 갱신.
+
+    작업 시작 시점의 스냅샷을 통째로 저장하면 그 사이 사용자가 수정한
+    대기열을 덮어쓰므로, 저장 직전에 파일을 다시 읽어 같은 행을 찾아
+    상태만 바꾼다. (행 식별: 계정 + 시간 + 본문)
+    """
+    with queue_lock:
+        current = load_queue()
+        for r in current:
+            if (r.get("account") == row.get("account")
+                    and r.get("time") == row.get("time")
+                    and r.get("content") == row.get("content")
+                    and r.get("status") != new_status):
+                r["status"] = new_status
+                save_queue(current)
+                return True
+    return False
 
 def scheduler_loop():
     global is_running
     add_log("[System] 백그라운드 스케줄러가 활성화되었습니다.")
-    
-    last_checked_minute = ""
-    
+
+    busy_log_minute = {}
+
     while is_running:
         try:
             now = datetime.datetime.now()
             now_str = now.strftime("%H:%M")
-            
-            # 1분에 한 번만 예약을 처리하도록 분 단위 확인
-            if now_str != last_checked_minute:
+            now_minutes = now.hour * 60 + now.minute
+
+            with queue_lock:
                 queue_data = load_queue()
-                config = load_config()
-                updated = False
-                
-                for row in queue_data:
-                    # Pending 상태이고, 지정된 포스팅 시간과 일치할 때
-                    if row.get("status") == "Pending" and row.get("time") == now_str:
-                        account = row.get("account", "").strip()
+            config = load_config()
+
+            for row in queue_data:
+                if row.get("status") == "Pending":
+                    row_minutes = parse_hhmm(row.get("time"))
+                    if row_minutes is None:
+                        continue
+
+                    # 자정 넘김을 고려한 예약 시각 경과(분) 계산.
+                    # 정각부터 GRACE_MINUTES 이내면 실행 대상 (앞 작업에 밀려 정각을 놓쳐도 실행됨)
+                    elapsed = (now_minutes - row_minutes) % (24 * 60)
+                    if elapsed > GRACE_MINUTES:
+                        continue
+
+                    account = row.get("account", "").strip()
+
+                    # 동일 계정의 작업이 이미 실행 중인지 확인
+                    with running_accounts_lock:
+                        if account in running_accounts:
+                            if busy_log_minute.get(account) != now_str:
+                                add_log(f"[System] 대기: 계정 '{account}'의 이전 작업이 아직 실행 중입니다. 완료되는 대로 이어서 실행합니다.")
+                                busy_log_minute[account] = now_str
+                            continue
+                        running_accounts.add(account)
+
+                    try:
+                        update_row_status(row, "Running")
+
+                        content = row.get("content", "").strip()
+                        comment = row.get("comment", "").strip()
+                        files_str = row.get("file", "").strip()
+                        ai_option = row.get("ai", "OFF")
+                        tag_str = row.get("tag", "").strip()
+                        topic = row.get("topic", "").strip()
                         
-                        # 동일 계정의 작업이 이미 실행 중인지 확인
+                        add_log(f"[System] 예약 작업 발행 시도 중... (계정: {account}, 시간: {now_str})")
+                        
+                        # 미디어 파일 경로 파싱 및 디렉토리/NFC/NFD 정상화 확장
+                        media_paths = []
+                        if files_str:
+                            raw_paths = [p.strip(" '\",[]") for p in files_str.split(",") if p.strip(" '\",[]")]
+                            post_index = queue_data.index(row)
+                            import unicodedata
+                            for r_path in raw_paths:
+                                # 바탕화면(Desktop) 권한 오류를 방지하기 위해 프로그램 폴더 경로로 자동 변환
+                                if "Desktop/thread_ing" in r_path:
+                                    r_path = r_path.replace("Desktop/thread_ing", "thread_ing")
+                                    
+                                abs_path = os.path.abspath(r_path)
+                                if not os.path.exists(abs_path):
+                                    path_nfc = unicodedata.normalize('NFC', abs_path)
+                                    path_nfd = unicodedata.normalize('NFD', abs_path)
+                                    if os.path.exists(path_nfd):
+                                        abs_path = path_nfd
+                                    elif os.path.exists(path_nfc):
+                                        abs_path = path_nfc
+                                
+                                if os.path.isdir(abs_path):
+                                    try:
+                                        subdirs = [os.path.join(abs_path, d) for d in os.listdir(abs_path) if os.path.isdir(os.path.join(abs_path, d))]
+                                        prefix1 = f"{post_index}_"
+                                        prefix2 = f"{post_index:02d}_"
+                                        matched_subdir = None
+                                        for sd in subdirs:
+                                            name = os.path.basename(sd)
+                                            if name.startswith(prefix1) or name.startswith(prefix2):
+                                                matched_subdir = sd
+                                                break
+                                        
+                                        source_dir = matched_subdir if matched_subdir else abs_path
+                                        valid_exts = ('.png', '.jpg', '.jpeg', '.webp', '.gif', '.heic', '.mp4', '.mov', '.m4v')
+                                        folder_files = []
+                                        for f in os.listdir(source_dir):
+                                            f_path = os.path.join(source_dir, f)
+                                            if os.path.isfile(f_path) and f.lower().endswith(valid_exts):
+                                                folder_files.append(f_path)
+                                        folder_files.sort()
+                                        media_paths.extend(folder_files)
+                                    except Exception as dir_err:
+                                        add_log(f"[System] 폴더 탐색 실패 ({abs_path}): {dir_err}")
+                                        media_paths.append(abs_path)
+                                else:
+                                    media_paths.append(abs_path)
+                            
+                        # AI 리라이팅 적용
+                        api_key = None
+                        if ai_option == "GPT":
+                            api_key = config.get("openai_api_key")
+                        elif ai_option == "Gemini":
+                            api_key = config.get("gemini_api_key")
+                        system_prompt = config.get("system_prompt", "")
+                        
+                        final_content = rewrite_content(content, ai_option, api_key, system_prompt)
+                        
+                        # 해시태그 및 주제(Topic) 포맷팅 및 본문 하단 추가
+                        tags_list = []
+                        if tag_str:
+                            for t in re.split(r'[,\s]+', tag_str):
+                                t_clean = t.strip()
+                                if t_clean:
+                                    if not t_clean.startswith("#"):
+                                        tags_list.append(f"#{t_clean}")
+                                    else:
+                                        tags_list.append(t_clean)
+                                        
+                        if topic:
+                            topic_clean = topic.strip()
+                            if topic_clean:
+                                topic_tag = f"#{topic_clean}" if not topic_clean.startswith("#") else topic_clean
+                                if topic_tag not in tags_list:
+                                    tags_list.append(topic_tag)
+                                    
+                        if tags_list:
+                            final_content = f"{final_content}\n\n{' '.join(tags_list)}"
+                        
+                        # Playwright 포스팅 진행
+                        uploader = ThreadsProUploader(session_dir=SESSION_DIR, log_callback=add_log)
+                        
+                        def run_upload_task(row_ref, acc_key):
+                            loop = asyncio.new_event_loop()
+                            asyncio.set_event_loop(loop)
+                            result_status = "Fail"
+                            try:
+                                success = loop.run_until_complete(
+                                    uploader.post_to_threads(
+                                        username=acc_key,
+                                        headless=config.get("headless", False),
+                                        content=final_content,
+                                        media_paths=media_paths,
+                                        comment_text=comment,
+                                        topic_text=topic,
+                                        publish_delay=config.get("publish_delay", 10)
+                                    )
+                                )
+                                result_status = "Success" if success else "Fail"
+                            except Exception as e:
+                                add_log(f"[{acc_key}] 치명적인 에러 발생: {e}")
+                            finally:
+                                loop.close()
+                                update_row_status(row_ref, result_status)
+                                with running_accounts_lock:
+                                    if acc_key in running_accounts:
+                                        running_accounts.remove(acc_key)
+                                add_log(f"[{acc_key}] 대기열 상태 업데이트 완료 ({result_status})")
+
+                        # 개별 업로드는 백그라운드 스레드에서 구동하여 다음 대기열 체크를 막지 않게 함
+                        threading.Thread(target=run_upload_task, args=(row, account), daemon=True).start()
+
+                    except Exception as prep_err:
+                        add_log(f"[System Error] 작업 준비 중 에러 발생: {prep_err}")
+                        update_row_status(row, "Fail")
                         with running_accounts_lock:
                             if account in running_accounts:
-                                add_log(f"[System] 대기: 계정 '{account}'의 이전 작업이 아직 실행 중입니다. 다음 주기(분)에 재시도합니다.")
-                                continue
-                            running_accounts.add(account)
-                        
-                        try:
-                            row["status"] = "Running"
-                            save_queue(queue_data)
-                            updated = True
-                            
-                            content = row.get("content", "").strip()
-                            comment = row.get("comment", "").strip()
-                            files_str = row.get("file", "").strip()
-                            ai_option = row.get("ai", "OFF")
-                            tag_str = row.get("tag", "").strip()
-                            topic = row.get("topic", "").strip()
-                            
-                            add_log(f"[System] 예약 작업 발행 시도 중... (계정: {account}, 시간: {now_str})")
-                            
-                            # 미디어 파일 경로 파싱 및 디렉토리/NFC/NFD 정상화 확장
-                            media_paths = []
-                            if files_str:
-                                raw_paths = [p.strip(" '\",[]") for p in files_str.split(",") if p.strip(" '\",[]")]
-                                post_index = queue_data.index(row)
-                                import unicodedata
-                                for r_path in raw_paths:
-                                    # 바탕화면(Desktop) 권한 오류를 방지하기 위해 프로그램 폴더 경로로 자동 변환
-                                    if "Desktop/thread_ing" in r_path:
-                                        r_path = r_path.replace("Desktop/thread_ing", "thread_ing")
-                                        
-                                    abs_path = os.path.abspath(r_path)
-                                    if not os.path.exists(abs_path):
-                                        path_nfc = unicodedata.normalize('NFC', abs_path)
-                                        path_nfd = unicodedata.normalize('NFD', abs_path)
-                                        if os.path.exists(path_nfd):
-                                            abs_path = path_nfd
-                                        elif os.path.exists(path_nfc):
-                                            abs_path = path_nfc
-                                    
-                                    if os.path.isdir(abs_path):
-                                        try:
-                                            subdirs = [os.path.join(abs_path, d) for d in os.listdir(abs_path) if os.path.isdir(os.path.join(abs_path, d))]
-                                            prefix1 = f"{post_index}_"
-                                            prefix2 = f"{post_index:02d}_"
-                                            matched_subdir = None
-                                            for sd in subdirs:
-                                                name = os.path.basename(sd)
-                                                if name.startswith(prefix1) or name.startswith(prefix2):
-                                                    matched_subdir = sd
-                                                    break
-                                            
-                                            source_dir = matched_subdir if matched_subdir else abs_path
-                                            valid_exts = ('.png', '.jpg', '.jpeg', '.webp', '.gif', '.heic', '.mp4', '.mov', '.m4v')
-                                            folder_files = []
-                                            for f in os.listdir(source_dir):
-                                                f_path = os.path.join(source_dir, f)
-                                                if os.path.isfile(f_path) and f.lower().endswith(valid_exts):
-                                                    folder_files.append(f_path)
-                                            folder_files.sort()
-                                            media_paths.extend(folder_files)
-                                        except Exception as dir_err:
-                                            add_log(f"[System] 폴더 탐색 실패 ({abs_path}): {dir_err}")
-                                            media_paths.append(abs_path)
-                                    else:
-                                        media_paths.append(abs_path)
-                                
-                            # AI 리라이팅 적용
-                            api_key = None
-                            if ai_option == "GPT":
-                                api_key = config.get("openai_api_key")
-                            elif ai_option == "Gemini":
-                                api_key = config.get("gemini_api_key")
-                            system_prompt = config.get("system_prompt", "")
-                            
-                            final_content = rewrite_content(content, ai_option, api_key, system_prompt)
-                            
-                            # 해시태그 및 주제(Topic) 포맷팅 및 본문 하단 추가
-                            tags_list = []
-                            if tag_str:
-                                for t in re.split(r'[,\s]+', tag_str):
-                                    t_clean = t.strip()
-                                    if t_clean:
-                                        if not t_clean.startswith("#"):
-                                            tags_list.append(f"#{t_clean}")
-                                        else:
-                                            tags_list.append(t_clean)
-                                            
-                            if topic:
-                                topic_clean = topic.strip()
-                                if topic_clean:
-                                    topic_tag = f"#{topic_clean}" if not topic_clean.startswith("#") else topic_clean
-                                    if topic_tag not in tags_list:
-                                        tags_list.append(topic_tag)
-                                        
-                            if tags_list:
-                                final_content = f"{final_content}\n\n{' '.join(tags_list)}"
-                            
-                            # Playwright 포스팅 진행
-                            uploader = ThreadsProUploader(session_dir=SESSION_DIR, log_callback=add_log)
-                            
-                            def run_upload_task(row_ref, q_ref, acc_key):
-                                loop = asyncio.new_event_loop()
-                                asyncio.set_event_loop(loop)
-                                try:
-                                    success = loop.run_until_complete(
-                                        uploader.post_to_threads(
-                                            username=acc_key,
-                                            headless=config.get("headless", False),
-                                            content=final_content,
-                                            media_paths=media_paths,
-                                            comment_text=comment,
-                                            topic_text=topic,
-                                            publish_delay=config.get("publish_delay", 10)
-                                        )
-                                    )
-                                    row_ref["status"] = "Success" if success else "Fail"
-                                except Exception as e:
-                                    add_log(f"[{acc_key}] 치명적인 에러 발생: {e}")
-                                    row_ref["status"] = "Fail"
-                                finally:
-                                    loop.close()
-                                    save_queue(q_ref)
-                                    with running_accounts_lock:
-                                        if acc_key in running_accounts:
-                                            running_accounts.remove(acc_key)
-                                    add_log(f"[{acc_key}] 대기열 상태 업데이트 완료 ({row_ref['status']})")
-                            
-                            # 개별 업로드는 백그라운드 스레드에서 구동하여 다음 대기열 체크를 막지 않게 함
-                            threading.Thread(target=run_upload_task, args=(row, queue_data, account), daemon=True).start()
-                            
-                        except Exception as prep_err:
-                            add_log(f"[System Error] 작업 준비 중 에러 발생: {prep_err}")
-                            row["status"] = "Fail"
-                            save_queue(queue_data)
-                            with running_accounts_lock:
-                                if account in running_accounts:
-                                    running_accounts.remove(account)
+                                running_accounts.remove(account)
                 
-                if updated:
-                    last_checked_minute = now_str
                     
             time.sleep(5) # 5초 주기로 스캔
         except Exception as e:

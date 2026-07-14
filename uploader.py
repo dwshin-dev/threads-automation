@@ -3,12 +3,28 @@ import re
 import json
 import random
 import asyncio
+import hashlib
 import logging
 import openai
+import pandas as pd
 import google.generativeai as genai
 from playwright.async_api import async_playwright, TimeoutError as PlaywrightTimeoutError
 
 logger = logging.getLogger("threads_pro_uploader")
+
+def safe_session_name(username):
+    """세션 파일명에 쓸 안전한 이름을 생성.
+
+    영문/숫자/밑줄 이외 문자를 제거하되, 제거로 인해 서로 다른 닉네임이
+    같은 파일명으로 뭉개지지 않도록 원본 닉네임의 해시를 덧붙인다.
+    (순수 영문/숫자 닉네임은 기존 파일명이 그대로 유지됨)
+    """
+    username = username or ""
+    stripped = re.sub(r"[^a-zA-Z0-9_]", "", username)
+    if stripped == username and stripped:
+        return stripped
+    suffix = hashlib.md5(username.encode("utf-8")).hexdigest()[:8]
+    return f"{stripped}_{suffix}" if stripped else f"u_{suffix}"
 
 def rewrite_content(text, provider, api_key, system_prompt):
     """지정한 AI 엔진을 사용해 스레드 본문을 변환(Rewriting)"""
@@ -219,7 +235,7 @@ class ThreadsProUploader:
 
     async def run_manual_login(self, username):
         """특정 계정으로 로그인 창을 띄워 세션 쿠키를 sessions/ 폴더에 영구 보관"""
-        safe_username = re.sub(r"[^a-zA-Z0-9_]", "", username)
+        safe_username = safe_session_name(username)
         session_file = os.path.join(self.session_dir, f"{safe_username}.json")
         profile_dir = os.path.join(self.session_dir, f"profile_{safe_username}")
         
@@ -370,7 +386,7 @@ class ThreadsProUploader:
 
     async def post_to_threads(self, username, headless, content, media_paths, comment_text, topic_text="", publish_delay=10):
         """Playwright 세션을 이용하여 본문 게시 및 첫 댓글(쿠팡 파자너스 등) 자동화 수행"""
-        safe_username = re.sub(r"[^a-zA-Z0-9_]", "", username)
+        safe_username = safe_session_name(username)
         session_file = os.path.join(self.session_dir, f"{safe_username}.json")
         user_profile_dir = os.path.join(self.session_dir, f"profile_{safe_username}")
         
@@ -408,7 +424,12 @@ class ThreadsProUploader:
             
             try:
                 await page.goto("https://www.threads.net/", timeout=45000)
-                await page.wait_for_load_state("networkidle")
+                # Threads 홈은 피드를 계속 불러와 networkidle에 도달하지 못하는 경우가 많으므로
+                # 짧게만 기다리고 실패해도 그대로 진행한다 (간헐적 타임아웃 실패 방지)
+                try:
+                    await page.wait_for_load_state("networkidle", timeout=10000)
+                except Exception:
+                    pass
                 await asyncio.sleep(2)
                 
                 # 로그인 상태 또는 로그아웃 상태 감지 대기 (최대 10초)
@@ -606,7 +627,8 @@ class ThreadsProUploader:
                         else:
                             normalized_paths.append(path)
                             
-                    initial_img_count = await dialog.locator('img').count()
+                    # 영상(mp4/mov)은 img가 아닌 video 태그로 프리뷰가 생기므로 둘 다 센다
+                    initial_img_count = await dialog.locator('img, video').count()
                     
                     # 1) Native input[type="file"] 요소를 통해 직접 파일 주입 시도 (FileChooser 대기 생략으로 타임아웃 원천 방지)
                     uploaded_via_input = False
@@ -648,7 +670,7 @@ class ThreadsProUploader:
                     self.log(f"[{username}] 미디어 업로드 및 프리뷰 생성 대기 중 (최대 10초)...")
                     uploaded_successfully = False
                     for _ in range(100):
-                        current_img_count = await dialog.locator('img').count()
+                        current_img_count = await dialog.locator('img, video').count()
                         if current_img_count >= initial_img_count + len(normalized_paths):
                             uploaded_successfully = True
                             break
@@ -832,8 +854,12 @@ class ThreadsProUploader:
                     await browser.close()
                     return False
                     
-                self.log(f"[{username}] 스레드 본문 및 댓글 일괄 발행 성공! 네트워크 요청 완료를 위해 5초 대기합니다.")
-                await asyncio.sleep(5)
+                try:
+                    wait_secs = max(1, int(publish_delay))
+                except (TypeError, ValueError):
+                    wait_secs = 5
+                self.log(f"[{username}] 스레드 본문 및 댓글 일괄 발행 성공! 네트워크 요청 완료를 위해 {wait_secs}초 대기합니다.")
+                await asyncio.sleep(wait_secs)
                 await context.close()
                 await browser.close()
                 return True
@@ -861,7 +887,7 @@ class ThreadsUploader:
         self._stop_flag = False
         
         # 계정 ID별 안전한 폴더명 가공 및 서브디렉토리 지정
-        safe_username = re.sub(r"[^a-zA-Z0-9_]", "", username) if username else "default"
+        safe_username = safe_session_name(username) if username else "default"
         # We pass this subfolder to ThreadsProUploader
         self.session_subfolder = os.path.join(self.user_data_dir, f"threads_session_{safe_username}")
         os.makedirs(self.session_subfolder, exist_ok=True)
@@ -882,7 +908,7 @@ class ThreadsUploader:
 
     async def open_login_session(self):
         self.log("로그인 세션 브라우저를 실행합니다...")
-        await self.pro_uploader.run_manual_login(self.username, headless=False)
+        await self.pro_uploader.run_manual_login(self.username)
 
     def get_upload_folders(self):
         """작업 디렉토리 내에서 처리할 업로드 폴더 목록을 정렬하여 반환"""

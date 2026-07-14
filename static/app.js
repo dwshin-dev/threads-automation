@@ -571,7 +571,10 @@ function appendClientLog(msg) {
     if (consoleBox) {
         const now = new Date();
         const timeStr = `[${String(now.getHours()).padStart(2, '0')}:${String(now.getMinutes()).padStart(2, '0')}:${String(now.getSeconds()).padStart(2, '0')}]`;
-        consoleBox.value += `${timeStr} ${msg}\n`;
+        const logLine = document.createElement("div");
+        logLine.className = "log-line";
+        logLine.innerText = `${timeStr} ${msg}`;
+        consoleBox.appendChild(logLine);
         consoleBox.scrollTop = consoleBox.scrollHeight;
     }
 }
